@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# greenlight — let an AI change your code, but only keep the change if it builds and passes your tests.
+#
+#   greenlight claude "add a --verbose flag"
+#   greenlight codex  "fix the failing date parser test"
+#   greenlight --cmd 'my-ai-tool --yes' "rename Foo to Bar"
+#   greenlight --plan
+#
+# What happens, every time:
+#   1. a separate copy of your project is made (a git worktree in a temp folder) from your last commit
+#   2. the AI edits that copy only; your own folder is never touched while it works
+#   3. the copy must BUILD and pass your TESTS, or the change is thrown away and nothing changes
+#   4. it is committed and fast-forwarded onto your current branch (or, with --keep-branch, left on a branch for review)
+#   5. INSTALL runs, if you set one
+# Every run is logged to ${XDG_STATE_HOME:-~/.local/state}/greenlight/<run-id>.log
+#
+# Copyright (C) 2026 the greenlight authors. Licensed under the GNU AGPL v3 or later; see LICENSE.
+set -u
+VERSION=0.1.0
+
+usage() {
+  cat <<'EOF'
+usage:
+  greenlight [options] <claude|codex> "what to change"
+  greenlight [options] --cmd '<command>' "what to change"
+  greenlight [-C folder] --plan
+
+  "what to change" can be - to read it from stdin.
+
+options:
+  -C <folder>      the project (default: the current folder)
+  --cmd '<cmd>'    use any AI tool: <cmd> runs in the copy with the instructions on stdin
+                   and in $GREENLIGHT_PROMPT
+  --keep-branch    don't merge; leave the tested change on branch greenlight-kept/<id> for you to review
+  --plan           show the build / test / install steps it would use, change nothing
+  -h, --help       this help
+  --version        print the version
+
+steps: put them in <project>/.greenlight as KEY=value lines (read, never run as a script):
+  BUILD=make
+  TEST=make test
+  INSTALL=make install        (optional; runs in your folder after the change lands)
+  PROTECT=tests/ .github/     (optional; paths the AI may not change, so it can't pass by weakening the tests)
+Without that file it guesses: Package.swift, package.json, Cargo.toml, go.mod, pytest.
+No test step = it refuses to run. A change it can't prove is a change it won't make.
+
+exit codes: 0 landed · 1 failed, nothing changed · 2 usage · 3 another run is going · 4 kept on a branch
+EOF
+}
+
+die() { echo "greenlight: $*" >&2; exit 2; }
+
+# ---------- arguments ----------
+PROJ="." WHO="" CMD="" KEEP=0 PLAN=0
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C) [ $# -ge 2 ] || die "-C needs a folder"; PROJ="$2"; shift 2 ;;
+    --cmd) [ $# -ge 2 ] && [ -n "$2" ] || die "--cmd needs a command"; WHO="cmd"; CMD="$2"; shift 2 ;;
+    --keep-branch) KEEP=1; shift ;;
+    --plan) PLAN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "greenlight $VERSION"; exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done ;;
+    -) POS+=("$1"); shift ;;
+    -*) die "unknown option $1 (see --help)" ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+if [ "$PLAN" = 0 ] && [ -z "$WHO" ]; then
+  [ ${#POS[@]} -gt 0 ] || { usage >&2; exit 2; }
+  WHO="${POS[0]}"; POS=(${POS[@]+"${POS[@]:1}"})
+fi
+INSTR="${POS[*]+${POS[*]}}"
+[ "$INSTR" = "-" ] && INSTR="$(cat)"
+
+PROJ="$(cd "$PROJ" 2>/dev/null && pwd -P)" || die "no such folder"
+git -C "$PROJ" rev-parse --show-toplevel >/dev/null 2>&1 || die "$PROJ is not inside a git repository"
+NAME="$(basename "$PROJ")"
+
+# ---------- steps ----------
+BUILD="" TEST="" INSTALL="" PROTECT="" NOTE=""
+read_steps() {  # plain KEY=value lines; nothing in the file is ever executed while reading it
+  local line key val
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in ''|'#'*) continue ;; *=*) ;; *) continue ;; esac
+    key="${line%%=*}"; val="${line#*=}"
+    key="${key#export }"; key="$(printf '%s' "$key" | tr -d ' \t')"
+    case "$val" in \"*\") val="${val:1:${#val}-2}" ;; \'*\') val="${val:1:${#val}-2}" ;; esac
+    case "$key" in BUILD) BUILD="$val" ;; TEST) TEST="$val" ;; INSTALL) INSTALL="$val" ;; PROTECT) PROTECT="$val" ;; esac
+  done < "$1"
+}
+detect() {
+  local d="$1"
+  if [ -f "$d/.greenlight" ]; then read_steps "$d/.greenlight"; return; fi
+  if [ -f "$d/Package.swift" ]; then BUILD="swift build"; [ -d "$d/Tests" ] && TEST="swift test"; fi
+  if [ -f "$d/Cargo.toml" ]; then BUILD="${BUILD:-cargo build}"; TEST="${TEST:-cargo test}"; fi
+  if [ -f "$d/go.mod" ]; then BUILD="${BUILD:-go build ./...}"; TEST="${TEST:-go test ./...}"; fi
+  if [ -f "$d/package.json" ]; then
+    grep -q '"build"[[:space:]]*:' "$d/package.json" && BUILD="${BUILD:-npm run build}"
+    grep -q '"test"[[:space:]]*:' "$d/package.json" && ! grep -q 'no test specified' "$d/package.json" && TEST="${TEST:-npm test}"
+  fi
+  if [ -z "$TEST" ] && { [ -d "$d/tests" ] || ls "$d"/test_*.py >/dev/null 2>&1; }; then
+    if [ -x "$d/.venv/bin/python" ] && "$d/.venv/bin/python" -m pytest --version >/dev/null 2>&1; then TEST=".venv/bin/python -m pytest -q"
+    elif python3 -m pytest --version >/dev/null 2>&1; then TEST="python3 -m pytest -q"
+    else NOTE=" (there are Python tests, but pytest isn't installed)"; fi
+  fi
+}
+detect "$PROJ"
+
+if [ "$PLAN" = 1 ]; then
+  echo "project: $PROJ"
+  echo "build:   ${BUILD:-(none)}"
+  echo "test:    ${TEST:-(none: greenlight will refuse to run until you add TEST= to .greenlight)$NOTE}"
+  echo "install: ${INSTALL:-(none)}"
+  echo "protect: ${PROTECT:-(none)}"
+  exit 0
+fi
+
+case "$WHO" in
+  claude|codex|cmd) ;;
+  *) die "unknown AI '$WHO': use claude, codex, or --cmd '<command>'" ;;
+esac
+[ -n "$INSTR" ] || die "say what to change"
+[ -n "$TEST" ] || die "no test step for $NAME, so a change can't be proven. Add TEST=... to $PROJ/.greenlight$NOTE"
+git -C "$PROJ" rev-parse -q --verify HEAD >/dev/null || die "$NAME has no commits yet; commit once first"
+TARGET="$(git -C "$PROJ" symbolic-ref -q --short HEAD)" || die "$PROJ is not on a branch (detached HEAD)"
+case "$WHO" in
+  claude) command -v claude >/dev/null || die "the claude CLI isn't installed" ;;
+  codex)  command -v codex  >/dev/null || die "the codex CLI isn't installed" ;;
+esac
+PREFIX="$(git -C "$PROJ" rev-parse --show-prefix)"   # the project may be a subfolder of its repo
+GITDIR="$(cd "$PROJ" && cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+
+# ---------- one run at a time per repo; a lock left by a crashed run is cleared ----------
+LOCK="$GITDIR/greenlight.lock"
+OWN_LOCK=0
+remove_stale() {
+  local wt="" line
+  git -C "$PROJ" worktree list --porcelain | while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) wt="${line#worktree }" ;;
+      "branch refs/heads/greenlight/"*) git -C "$PROJ" worktree remove --force "$wt" >/dev/null 2>&1 ;;
+    esac
+  done
+  git -C "$PROJ" worktree prune >/dev/null 2>&1
+  git -C "$PROJ" for-each-ref --format='%(refname:short)' refs/heads/greenlight/ | while IFS= read -r b; do
+    git -C "$PROJ" branch -D "$b" >/dev/null 2>&1
+  done
+}
+if ! mkdir "$LOCK" 2>/dev/null; then
+  owner="$(cat "$LOCK/pid" 2>/dev/null)"
+  if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+    echo "greenlight: another run is going on this repo (pid $owner). Wait for it to finish." >&2; exit 3
+  fi
+  echo "greenlight: cleaning up after an interrupted run"
+  remove_stale; rm -rf "$LOCK"
+  mkdir "$LOCK" 2>/dev/null || { echo "greenlight: couldn't take the lock $LOCK" >&2; exit 3; }
+fi
+OWN_LOCK=1
+echo $$ > "$LOCK/pid"
+
+ID="$(date +%Y%m%d-%H%M%S)-$$"
+BRANCH="greenlight/$ID"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/greenlight.XXXXXX")"
+WT="$TMP/copy"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/greenlight"
+mkdir -p "$STATE" && LOGF="$STATE/$ID.log" && : > "$LOGF" && chmod 600 "$LOGF" || LOGF=/dev/null
+KEPT=""
+
+cleanup() {
+  cd / 2>/dev/null
+  git -C "$PROJ" worktree remove --force "$WT" >/dev/null 2>&1
+  [ -z "$KEPT" ] && git -C "$PROJ" branch -D "$BRANCH" >/dev/null 2>&1
+  rm -rf "$TMP"
+  [ "$OWN_LOCK" = 1 ] && rm -rf "$LOCK"
+}
+trap cleanup EXIT
+trap 'echo "greenlight: stopped; nothing changed" >&2; exit 130' INT TERM HUP
+
+say() { printf 'greenlight: %s\n' "$*"; printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOGF"; }
+fail() { say "FAILED at $1: $2. Nothing in $NAME was changed."; exit 1; }
+run_step() {  # seconds command-string: runs it with output to the screen and the log; returns its exit code
+  local secs="$1"; shift
+  if command -v perl >/dev/null; then
+    perl -e 'alarm shift; exec @ARGV' "$secs" bash -c "$1" < /dev/null 2>&1 | tee -a "$LOGF"
+  else
+    bash -c "$1" < /dev/null 2>&1 | tee -a "$LOGF"
+  fi
+  return "${PIPESTATUS[0]}"
+}
+
+say "$NAME on $TARGET · ai: $WHO · build: ${BUILD:-none} · test: $TEST · install: ${INSTALL:-none}"
+say "instruction: $INSTR"
+git -C "$PROJ" worktree add -q -b "$BRANCH" "$WT" HEAD >> "$LOGF" 2>&1 || fail copy "couldn't make the working copy"
+cd "$WT/$PREFIX" || fail copy "working copy missing"
+
+GUIDE=""
+for f in AGENTS.md CLAUDE.md README.md; do [ -f "$f" ] && { GUIDE="$f"; break; }; done
+PROMPT="You are changing the project in the current folder ($NAME).${GUIDE:+ Read $GUIDE first.}
+Make this change: $INSTR
+Rules: edit only files inside this folder;${PROTECT:+ do not change these paths: $PROTECT;} never print or log secrets; don't deploy, push, send messages,
+delete anything outside this folder or spend money. After your change these must pass:${BUILD:+ build: $BUILD;} test: $TEST.
+Don't commit; that's done for you once the checks pass. Stop when the change is made."
+
+say "working copy ready; handing it to $WHO"
+case "$WHO" in
+  claude) claude -p "$PROMPT" --permission-mode acceptEdits --allowedTools "Read,Edit,Write,Glob,Grep" < /dev/null 2>&1 | tee -a "$LOGF" ;;
+  codex)  codex exec --full-auto "$PROMPT" < /dev/null 2>&1 | tee -a "$LOGF" ;;
+  cmd)    printf '%s\n' "$PROMPT" | GREENLIGHT_PROMPT="$PROMPT" bash -c "$CMD" 2>&1 | tee -a "$LOGF" ;;
+esac
+ps=("${PIPESTATUS[@]}")              # copy at once: the next command resets PIPESTATUS
+rc=${ps[0]}; [ "$WHO" = cmd ] && rc=${ps[1]}
+[ "$rc" -eq 0 ] || fail ai "$WHO exited $rc"
+
+git add -A . >> "$LOGF" 2>&1
+[ -n "$(git status --porcelain .)" ] || fail ai "$WHO made no changes"
+say "changed:"; git diff --cached --stat | tee -a "$LOGF"
+if [ -n "$PROTECT" ]; then   # the AI may not touch protected paths (e.g. the tests it is judged by)
+  hit=""
+  while IFS= read -r -d '' f; do
+    for p in $PROTECT; do
+      p="${p#./}"
+      case "$f" in "$p"|"${p%/}/"*) hit="$hit $f"; break ;; esac
+    done
+  done < <(git diff --cached --name-only --relative -z)
+  [ -z "$hit" ] || fail protect "$WHO changed protected paths:$hit"
+fi
+
+if [ -n "$BUILD" ]; then
+  say "build: $BUILD"
+  run_step "${GREENLIGHT_BUILD_TIMEOUT:-1800}" "$BUILD" || fail build "the build failed"
+fi
+say "test: $TEST"
+run_step "${GREENLIGHT_TEST_TIMEOUT:-600}" "$TEST" || fail test "the tests failed"
+say "build and tests passed"
+
+ID_ARGS=()
+git config user.email >/dev/null 2>&1 || ID_ARGS+=(-c user.name=greenlight -c user.email=greenlight@localhost)
+git ${ID_ARGS[@]+"${ID_ARGS[@]}"} commit -q -m "$(printf 'greenlight (%s): %s' "$WHO" "$INSTR" | head -c 2000)" \
+  >> "$LOGF" 2>&1 || fail commit "couldn't commit in the copy"
+NEW="$(git rev-parse --short HEAD)"
+
+keep() {  # $1 = why; leave the tested change on a branch instead of throwing it away
+  git -C "$PROJ" worktree remove --force "$WT" >/dev/null 2>&1
+  KEPT="greenlight-kept/$ID"
+  git -C "$PROJ" branch -m "$BRANCH" "$KEPT" >/dev/null 2>&1 || KEPT="$BRANCH"
+  say "$1"
+  say "the tested change is on branch $KEPT"
+  say "  look:  git diff $TARGET...$KEPT"
+  say "  take:  git merge $KEPT"
+  exit 4
+}
+cd "$PROJ" || fail merge "project folder vanished"
+[ "$KEEP" = 1 ] && keep "--keep-branch: not merged, as asked"
+git merge -q --ff-only "$BRANCH" >> "$LOGF" 2>&1 \
+  || keep "$TARGET moved during the run, or you have unsaved edits to the same files, so $TARGET was left alone"
+say "landed $NEW on $TARGET"
+
+if [ -n "$INSTALL" ]; then
+  say "install: $INSTALL"
+  run_step "${GREENLIGHT_INSTALL_TIMEOUT:-900}" "$INSTALL" || { say "committed $NEW, but the install step failed"; exit 1; }
+fi
+say "done (log: $LOGF)"
